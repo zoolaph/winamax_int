@@ -1,0 +1,17 @@
+{
+  "EXERCISE": "Write a task definition for a Node.js betting-api service.",
+  "REQUIREMENTS": {
+    "name": "betting-api",
+    "image": "ECR image from account 123456789, region eu-west-1",
+    "cpu": "1 vCPU (1024 CPU units)",
+    "memory": "2 GB (2048 MB)",
+    "port": 3000,
+    "env": "NODE_ENV=production",
+    "secret": "DATABASE_URL from Secrets Manager",
+    "logs": "CloudWatch under /ecs/betting-api",
+    "health_check": "GET /health on port 3000",
+    "app_permissions": "Read from S3"
+  },
+  "YOUR_ANSWER_BELOW": "Replace this entire object with your task definition JSON",
+  "HINT": "You need two IAM role ARNs. Which AWS actions does each one authorize?"
+}

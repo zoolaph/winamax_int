@@ -1,0 +1,32 @@
+{
+  "comment": "Relevant parts of the ECS task definition for loading OTel instrumentation",
+  "containerDefinitions": [
+    {
+      "name": "bet-validator",
+      "image": "123456789.dkr.ecr.eu-west-1.amazonaws.com/bet-validator:latest",
+      "command": ["node", "--require", "/app/instrumentation.js", "bet-validator.js"],
+      "environment": [
+        {
+          "name": "OTEL_SERVICE_NAME",
+          "value": "bet-validator"
+        },
+        {
+          "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
+          "value": "http://localhost:4317"
+        },
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        }
+      ]
+    },
+    {
+      "name": "otel-collector",
+      "image": "otel/opentelemetry-collector-contrib:latest",
+      "command": ["--config=/etc/otel/config.yaml"],
+      "portMappings": [
+        { "containerPort": 4317, "protocol": "tcp" }
+      ]
+    }
+  ]
+}

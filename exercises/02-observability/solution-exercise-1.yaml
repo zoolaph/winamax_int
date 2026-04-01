@@ -1,0 +1,129 @@
+# Solution: Exercise 1 — Production OTel Collector Config
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 1. ALWAYS FIRST: protect against OOM under traffic spikes
+  memory_limiter:
+    limit_mib: 512
+    spike_limit_mib: 128
+    check_interval: 1s
+
+  # 2. Enrich every span with deployment context
+  attributes/enrich:
+    actions:
+      - key: deployment.environment
+        value: production
+        action: upsert
+      - key: region
+        value: eu-west-1
+        action: upsert
+
+  # 3. Scrub PII before anything is exported
+  attributes/scrub-pii:
+    actions:
+      - key: player.name
+        action: delete
+      - key: player.email
+        action: delete
+      - key: player.phone
+        action: delete
+      - key: bet.amount
+        action: delete
+      - key: http.client_ip
+        action: delete
+      - key: db.statement    # SQL queries may contain player data
+        action: delete
+      - key: http.request_body
+        action: delete
+
+  # 4. Tail-based sampling — make decision after trace completes
+  tail_sampling:
+    decision_wait: 10s       # wait up to 10s for all spans of a trace
+    num_traces: 100000       # buffer capacity (tune based on memory)
+    expected_new_traces_per_sec: 1000
+
+    policies:
+      # ALWAYS keep: any span in the trace had an error
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+
+      # ALWAYS keep: trace took longer than 300ms
+      - name: keep-slow-traces
+        type: latency
+        latency:
+          threshold_ms: 300
+
+      # ALWAYS keep: traces on the critical betting and payment paths
+      - name: keep-critical-services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values:
+            - "betting-api"
+            - "payment-service"
+            - "auth-service"
+
+      # Keep 5% of all other traces (normal healthy traffic)
+      - name: probabilistic-sample
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+
+  # 5. ALWAYS LAST: batch before sending to reduce network calls
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 5s
+
+exporters:
+  # Traces → Jaeger
+  otlp/jaeger:
+    endpoint: jaeger-collector.monitoring:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+  # Metrics → Prometheus scrapes this endpoint
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: winamax
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # memory_limiter first, scrub PII before sampling, batch last
+      processors: [memory_limiter, attributes/scrub-pii, attributes/enrich, tail_sampling, batch]
+      exporters: [otlp/jaeger]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/enrich, batch]
+      exporters: [prometheus]
+
+  # Enable internal telemetry for the Collector itself
+  telemetry:
+    logs:
+      level: "info"
+    metrics:
+      level: "detailed"
+      address: 0.0.0.0:8888  # Prometheus can also scrape Collector health metrics here
