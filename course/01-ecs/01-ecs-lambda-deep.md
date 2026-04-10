@@ -227,108 +227,167 @@ K8s analogy: reserved concurrency is like setting `resources.limits` on a Pod. P
 
 ---
 
-## 4. Event Sources — Retry Behavior and Operational Characteristics
+## 4. Event Sources
 
-Each trigger type has its own invocation model, retry behavior, and failure semantics. Getting this wrong causes silent data loss or infinite retry loops.
+An event source is whatever triggers your Lambda. The key question for each one is:
+**if Lambda fails or is too busy — what happens to the event?**
 
-### SQS
-
-```
-SQS -> Lambda Polling Architecture
-===================================
-
-SQS Queue
-┌──────────────────────────┐
-│ msg1 msg2 msg3 msg4 ...  │
-└──────────────┬───────────┘
-               │  Lambda service polls the queue (not your code)
-               │  Batch size: 1-10,000 messages
-               │  Batch window: 0-300 seconds
-               v
-┌─────────────────────────┐
-│   Lambda Execution      │
-│   Environment           │
-│   handler(event)        │  <- event.Records contains the batch
-└────────────┬────────────┘
-             │
-    SUCCESS: messages deleted from queue
-    FAILURE: messages return to queue after visibility timeout
-             -> retried -> DLQ after max receive count
-```
-
-**Visibility timeout rule**: must be at least 6x your Lambda timeout. If your Lambda times out at 30 seconds, set visibility timeout to 180 seconds minimum. If not, a slow execution causes messages to become visible while Lambda is still processing them — you get duplicate processing.
-
-**Concurrency scaling**: Lambda scales the number of pollers based on queue depth. Starts at 5 pollers, adds up to 60/minute, up to reserved or account limit. Each poller is a concurrent Lambda execution.
-
-**Partial batch failure**: if your batch has 10 messages and message 7 fails, by default the entire batch is retried (messages 1-6 re-processed). Use `ReportBatchItemFailures` to return only the failed message IDs — Lambda only retries those, preventing duplicate processing of successes.
-
-### S3
-
-- **Invocation model**: asynchronous (fire-and-forget from S3's perspective)
-- **Automatic retries**: 2 retries with exponential backoff
-- **No ordering guarantee**: events may arrive out of order
-- **DLQ**: configure `DestinationConfig` on the Lambda function (not the S3 bucket) to capture failures
-- **Typical use**: image processing, log ingestion, ETL triggering, data quality checks
-
-```python
-def handler(event, context):
-    for record in event['Records']:
-        bucket = record['s3']['bucket']['name']
-        key = record['s3']['object']['key']
-        # process the object
-```
-
-### DynamoDB Streams and Kinesis
-
-These are **shard-based** triggers. This creates a different failure behavior from SQS:
+The answer depends on one fundamental split:
 
 ```
-Kinesis Stream / DynamoDB Stream
-==================================
+PULL-based (Lambda polls)          PUSH-based (source calls Lambda)
+──────────────────────────         ──────────────────────────────────
+SQS                                API Gateway
+Kinesis                            S3
+DynamoDB Streams                   EventBridge
+                                   SNS
 
-Shard 0: [rec1][rec2][rec3][rec4][rec5]...
-                ^
-                Lambda reads from here (iterator position)
-                Ordering GUARANTEED within the shard
+Lambda reaches out and             The source fires at Lambda.
+fetches work when ready.           Lambda must respond immediately.
 
-If rec3 fails:
-  - Lambda retries the ENTIRE batch from rec3 onward
-  - Shard processing is BLOCKED until rec3 succeeds or expires
-  - This is by design: ordering must be preserved
+Backpressure is natural:           No buffer — if Lambda is busy
+events stay in the queue           or fails, it's the source's
+until Lambda picks them up.        problem to decide what to do.
 ```
 
-**The stuck shard problem**: if a poison-pill message causes repeated failures, the shard stops advancing. Data piles up. Your consumer falls behind. This is one of the most painful Lambda operational failures.
+---
 
-**Escape valves** — configure all three on production stream consumers:
+### SQS — Pull, Safe, Forgiving
+
+SQS is the most operationally forgiving trigger. Messages sit in a queue. Lambda polls and processes batches. If Lambda fails, the message goes back in the queue and gets retried.
+
+```
+SQS Queue: [msg1][msg2][msg3][msg4]...
+                    |
+          Lambda polls (not your code — AWS does this)
+                    |
+          Processes a batch (up to 10,000 messages)
+                    |
+          SUCCESS → messages deleted from queue
+          FAILURE → messages become visible again → retried → DLQ
+```
+
+**The one rule you must know — visibility timeout:**
+
+When Lambda picks up a message, SQS hides it from other consumers for a duration called the visibility timeout. If Lambda doesn't finish within that window, SQS assumes Lambda died and makes the message visible again — causing duplicate processing.
+
+**Rule: set visibility timeout to at least 6× your Lambda timeout.**
+
+```
+Lambda timeout = 30s  →  visibility timeout must be ≥ 180s
+```
+
+**Partial batch failure:**
+
+If your batch has 10 messages and message 7 crashes, by default Lambda retries all 10 — including 1-6 that already succeeded. That's wasteful and dangerous (double processing).
+
+Fix: enable `ReportBatchItemFailures`. Your handler returns only the IDs of failed messages. Lambda retries only those.
+
+---
+
+### Kinesis / DynamoDB Streams — Pull, Ordered, Unforgiving
+
+These work like SQS with one critical difference: **ordering is guaranteed within a shard.**
+
+```
+Shard 0: [rec1] → [rec2] → [rec3] → [rec4] → [rec5]...
+                             ↑
+                         Lambda is here
+
+rec3 fails:
+  → Lambda cannot skip to rec4 (that would break ordering)
+  → Lambda retries rec3... and retries... and retries
+  → The entire shard is FROZEN until rec3 succeeds or expires
+```
+
+This is the **stuck shard** problem. A single bad record (poison pill) halts all processing on that shard. Records pile up behind it. Your consumer falls further and further behind.
+
+**You must configure these three settings on every stream consumer:**
 
 | Setting | What it does |
 |---|---|
-| `BisectBatchOnFunctionError: true` | On failure, split batch in half, retry each half independently. Narrows down the bad record. |
-| `MaximumRetryAttempts: N` | Give up after N retries (don't retry forever) |
-| `DestinationConfig.OnFailure` | Send failed batches to SQS or SNS after exhausting retries |
+| `BisectBatchOnFunctionError: true` | On failure, split the batch in half and retry each half. Quickly isolates the one bad record. |
+| `MaximumRetryAttempts: N` | Stop retrying after N attempts. Don't loop forever. |
+| `DestinationConfig.OnFailure` | After retries are exhausted, send the failed batch to SQS/SNS so the shard can unblock. |
 
-### API Gateway
+Without these, one malformed event can halt your consumer permanently.
 
-- **Invocation model**: synchronous — Lambda runs, API GW waits, returns the response
-- **No automatic retry**: caller gets the response or error, period
-- **Hard timeout**: 29 seconds (API Gateway limit, not Lambda's 15-minute limit)
-  - Your Lambda timeout must be less than 29 seconds when used with API GW
-  - If Lambda times out, API GW returns 504
-- **Throttling**: returns 429 to the caller — your client must handle this
+**How to monitor:** watch the `IteratorAge` CloudWatch metric. It measures how far behind the shard tip you are. A growing IteratorAge = your consumer is stuck or falling behind.
 
-### EventBridge
+---
 
-- **Invocation model**: asynchronous
-- **Automatic retries**: 2 retries with exponential backoff (up to 24 hours)
-- **DLQ**: configurable on the EventBridge rule's target
-- **Use case**: event-driven architectures, cross-service routing, scheduled triggers
+### S3 — Push, Async, Fire and Forget
 
-### EventBridge Scheduler (Scheduled Invocations)
+A file is uploaded to S3 → S3 calls your Lambda. Lambda processes it.
 
-- Cron or rate expression (`rate(5 minutes)`, `cron(0 12 * * ? *)`)
-- Asynchronous invocation
-- If throttled: the scheduled invocation is dropped (not retried)
-- Use for: data quality checks, nightly ETL, cache warming, report generation
+```
+File uploaded to S3
+       ↓
+S3 fires event at Lambda (asynchronously — S3 doesn't wait for a response)
+       ↓
+Lambda runs: reads the file, transforms it, stores the result
+       ↓
+SUCCESS → done
+FAILURE → Lambda retries automatically (2 times with backoff)
+        → After 2 retries, event goes to DLQ (if configured on the Lambda function)
+```
+
+Key points:
+- S3 does not wait for Lambda to finish — it fires and forgets
+- Events can arrive out of order (two uploads close together may trigger in any sequence)
+- Configure the DLQ on the **Lambda function**, not on the S3 bucket
+
+---
+
+### API Gateway — Push, Synchronous, No Retry
+
+This is the only trigger where something is actively waiting for Lambda's response.
+
+```
+HTTP request → API Gateway → Lambda runs → response returned to caller
+                                  ↓
+                            FAILURE or TIMEOUT
+                                  ↓
+                         API GW returns error to caller immediately
+                         No retry. The caller handles it.
+```
+
+Key constraints:
+- **Hard timeout: 29 seconds** — this is API Gateway's limit, not Lambda's. If your Lambda runs longer than 29s, API GW returns 504 regardless.
+- **Throttled:** API GW returns HTTP 429 to the caller. No buffering, no retry from AWS.
+- Your Lambda timeout must be set below 29 seconds when used with API GW.
+
+---
+
+### EventBridge — Push, Async, Retries Included
+
+An event happens in your system (e.g. "bet settled") → EventBridge routes it → Lambda processes it.
+
+```
+Event published to EventBridge
+       ↓
+EventBridge calls Lambda (asynchronously)
+       ↓
+FAILURE → EventBridge retries up to 2 times with exponential backoff
+        → After retries: sent to DLQ if configured
+```
+
+**EventBridge Scheduler (cron):** runs Lambda on a schedule (`rate(5 minutes)`, `cron(0 8 * * ? *)`). If Lambda is throttled when the schedule fires, the invocation is simply **dropped** — not retried. If this matters, add a DLQ.
+
+---
+
+### Summary — What Happens When Lambda Fails
+
+| Source | If Lambda fails | If Lambda is throttled (too busy) |
+|---|---|---|
+| SQS | Message returns to queue, retried, then DLQ | Message stays in queue until Lambda is free |
+| Kinesis/DynamoDB Streams | Shard blocks, retried until `MaximumRetryAttempts` | Shard blocks |
+| S3 | 2 automatic retries, then DLQ | Event dropped (no buffer) |
+| API Gateway | Error returned to caller immediately | HTTP 429 returned to caller |
+| EventBridge | 2 automatic retries, then DLQ | Event dropped |
+| EventBridge Scheduler | 2 automatic retries, then DLQ | Invocation dropped |
+
+The pattern: **pull-based sources (SQS, Kinesis) are naturally resilient** because the data lives in a queue/stream until Lambda consumes it. **Push-based sources depend on either retries or a DLQ** — and if neither is configured, the event is lost.
 
 ---
 
